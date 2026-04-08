@@ -1,0 +1,11 @@
+# Lambda layer dependencies — boto3 is excluded (pre-installed in the Lambda runtime).
+# lxml and Pillow contain native C extensions; they MUST be compiled inside the
+# Amazon Linux 2023 environment.  Use build_layer.sh (Docker) to produce a
+# correct layer zip.
+
+python-docx==1.1.2
+markdown==3.6
+beautifulsoup4==4.12.3
+lxml==5.2.2
+Pillow==10.4.0
+requests==2.32.3
