@@ -7,72 +7,81 @@ styles, page layout, headers, footers, and images.
 import base64
 import re
 import urllib.request
+import zipfile
 from io import BytesIO
+import os
+import subprocess
+import tempfile
 from typing import Optional
 
-import markdown
-from bs4 import BeautifulSoup, NavigableString, Tag
 from docx import Document
-from docx.shared import Pt, Inches
+from docx.shared import Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.enum.style import WD_STYLE_TYPE
+
+
+# ---------------------------------------------------------------------------
+# Mapfre font map — derived from the template's styles.xml definitions.
+# Keys are OOXML style IDs (w:styleId); value is (ascii, hAnsi, cs).
+# None covers paragraphs with no explicit pStyle (defaults to Normal).
+# ---------------------------------------------------------------------------
+
+_DISPLAY = "Mapfre Display"
+_TEXT = "Mapfre Text"
+
+# Headings 1-3: Display for all three font slots (as in styles.xml)
+# Headings 4-9: Display for ascii/hAnsi; cs follows the template (Times New Roman)
+# Body, lists, Normal, fallback: Text for all slots
+_MAPFRE_RFONTS: dict[Optional[str], tuple[str, str, str]] = {
+    "Heading1": (_DISPLAY, _DISPLAY, _DISPLAY),
+    "Heading2": (_DISPLAY, _DISPLAY, _DISPLAY),
+    "Heading3": (_DISPLAY, _DISPLAY, _DISPLAY),
+    "Heading4": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Heading5": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Heading6": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Heading7": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Heading8": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Heading9": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Caption": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Cabecera1": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Cabecera2": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Anexo1": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "Anexo2": (_DISPLAY, _DISPLAY, "Times New Roman"),
+    "BodyText": (_TEXT, _TEXT, _TEXT),
+    None: (_TEXT, _TEXT, _TEXT),  # Normal (no explicit pStyle)
+    "Normal": (_TEXT, _TEXT, _TEXT),
+    "ListParagraph": (_TEXT, _TEXT, _TEXT),
+    "ListBullet": (_TEXT, _TEXT, _TEXT),
+    "ListBullet2": (_TEXT, _TEXT, _TEXT),
+    "ListBullet3": (_TEXT, _TEXT, _TEXT),
+    "ListNumber": (_TEXT, _TEXT, _TEXT),
+    "ListNumber2": (_TEXT, _TEXT, _TEXT),
+    "ListNumber3": (_TEXT, _TEXT, _TEXT),
+    "IntenseQuote": (_TEXT, _TEXT, _TEXT),
+    "Quote": (_TEXT, _TEXT, _TEXT),
+    "NoSpacing": (_TEXT, _TEXT, _TEXT),
+}
+
+
+def _make_rfonts(ascii_f: str, hansi_f: str, cs_f: str):
+    """Create a fresh <w:rFonts> element with the given font slots."""
+    elem = OxmlElement("w:rFonts")
+    elem.set(qn("w:ascii"), ascii_f)
+    elem.set(qn("w:hAnsi"), hansi_f)
+    elem.set(qn("w:cs"), cs_f)
+    return elem
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _collect_style_names(doc: Document) -> set:
-    return {s.name for s in doc.styles}
 
-
-def _best_style(available: set, *candidates: str) -> Optional[str]:
-    """Return the first candidate that exists in the document styles."""
-    for name in candidates:
-        if name and name in available:
-            return name
-    return None
-
-
-def _add_horizontal_rule(paragraph) -> None:
-    pPr = paragraph._p.get_or_add_pPr()
-    pBdr = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), "6")
-    bottom.set(qn("w:space"), "1")
-    bottom.set(qn("w:color"), "auto")
-    pBdr.append(bottom)
-    pPr.append(pBdr)
-
-
-def _add_hyperlink(paragraph, text: str, url: str) -> None:
-    if not url:
-        paragraph.add_run(text)
-        return
-    try:
-        r_id = paragraph.part.relate_to(
-            url,
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink",
-            is_external=True,
-        )
-        hyperlink = OxmlElement("w:hyperlink")
-        hyperlink.set(qn("r:id"), r_id)
-        new_run = OxmlElement("w:r")
-        rPr = OxmlElement("w:rPr")
-        rStyle = OxmlElement("w:rStyle")
-        rStyle.set(qn("w:val"), "Hyperlink")
-        rPr.append(rStyle)
-        new_run.append(rPr)
-        t = OxmlElement("w:t")
-        t.text = text
-        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        new_run.append(t)
-        hyperlink.append(new_run)
-        paragraph._p.append(hyperlink)
-    except Exception:
-        run = paragraph.add_run(text)
-        run.underline = True
+def _collect_style_names(doc: Document) -> dict[str, set]:
+    paragraph_styles = {s.name for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH}
+    character_styles = {s.name for s in doc.styles if s.type == WD_STYLE_TYPE.CHARACTER}
+    return {"paragraph": paragraph_styles, "character": character_styles}
 
 
 def _fetch_image(src: str) -> Optional[bytes]:
@@ -83,9 +92,7 @@ def _fetch_image(src: str) -> Optional[bytes]:
             return base64.b64decode(m.group(1))
     elif src.startswith(("http://", "https://")):
         try:
-            req = urllib.request.Request(
-                src, headers={"User-Agent": "Mozilla/5.0"}
-            )
+            req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 return resp.read()
         except Exception:
@@ -93,364 +100,209 @@ def _fetch_image(src: str) -> Optional[bytes]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Inline content builder
-# ---------------------------------------------------------------------------
-
-def _add_run_with_fmt(
-    paragraph,
-    text: str,
-    bold: bool = False,
-    italic: bool = False,
-    underline: bool = False,
-    strike: bool = False,
-    code: bool = False,
-) -> None:
-    if not text:
-        return
-    run = paragraph.add_run(text)
-    if bold:
-        run.bold = True
-    if italic:
-        run.italic = True
-    if underline:
-        run.underline = True
-    if strike:
-        run.font.strike = True
-    if code:
-        run.font.name = "Courier New"
-        run.font.size = Pt(9)
-
-
-def _inline(
-    paragraph,
-    element,
-    bold: bool = False,
-    italic: bool = False,
-    underline: bool = False,
-    strike: bool = False,
-    code: bool = False,
-) -> None:
-    """Recursively walk inline HTML elements and add runs to *paragraph*."""
-    for child in element.children:
-        if isinstance(child, NavigableString):
-            text = str(child)
-            if text:
-                _add_run_with_fmt(
-                    paragraph, text, bold, italic, underline, strike, code
-                )
-            continue
-
-        if not hasattr(child, "name") or child.name is None:
-            continue
-
-        tag = child.name.lower()
-
-        if tag in ("strong", "b"):
-            _inline(paragraph, child, bold=True, italic=italic,
-                    underline=underline, strike=strike, code=code)
-        elif tag in ("em", "i"):
-            _inline(paragraph, child, bold=bold, italic=True,
-                    underline=underline, strike=strike, code=code)
-        elif tag == "u":
-            _inline(paragraph, child, bold=bold, italic=italic,
-                    underline=True, strike=strike, code=code)
-        elif tag in ("s", "del", "strike"):
-            _inline(paragraph, child, bold=bold, italic=italic,
-                    underline=underline, strike=True, code=code)
-        elif tag == "code":
-            _inline(paragraph, child, bold=bold, italic=italic,
-                    underline=underline, strike=strike, code=True)
-        elif tag == "a":
-            href = child.get("href", "")
-            link_text = child.get_text()
-            if href:
-                _add_hyperlink(paragraph, link_text, href)
-            else:
-                _add_run_with_fmt(paragraph, link_text, bold, italic,
-                                   underline, strike, code)
-        elif tag == "br":
-            paragraph.add_run("\n")
-        elif tag == "img":
-            src = child.get("src", "")
-            alt = child.get("alt", "")
-            if src:
-                img_bytes = _fetch_image(src)
-                if img_bytes:
-                    try:
-                        run = paragraph.add_run()
-                        run.add_picture(BytesIO(img_bytes), width=Inches(3))
-                    except Exception:
-                        _add_run_with_fmt(paragraph, f"[Image: {alt}]")
-                else:
-                    _add_run_with_fmt(paragraph, f"[Image: {alt}]")
-            elif alt:
-                _add_run_with_fmt(paragraph, f"[Image: {alt}]")
-        elif tag == "span":
-            _inline(paragraph, child, bold, italic, underline, strike, code)
-        else:
-            # Unknown inline tag — just emit its text
-            text = child.get_text()
-            if text:
-                _add_run_with_fmt(paragraph, text, bold, italic,
-                                   underline, strike, code)
-
-
-# ---------------------------------------------------------------------------
-# Main processor class
-# ---------------------------------------------------------------------------
-
 class DocumentProcessor:
     """
-    Loads a .docx template, clears its body, and fills it with
-    the content described by markdown_text, using the template's own styles.
+    Loads a .docx template, clears its body,
+    then rebuilds content from parsed markdown — preserving all template
+    styles, page layout, headers, footers, and images.
     """
 
     def __init__(self):
         self.doc: Optional[Document] = None
-        self.styles: set = set()
+        self.styles: dict[str, set] = {"paragraph": set(), "character": set()}
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def process(self, template_bytes: bytes, markdown_text: str) -> bytes:
-        self.doc = Document(BytesIO(template_bytes))
-        self.styles = _collect_style_names(self.doc)
+    def process(
+        self,
+        template_bytes: bytes,
+        markdown_text: str,
+        cover_fields: Optional[dict] = None,
+    ) -> bytes:
+        # Step 1: Use Pandoc to convert markdown to a temporary DOCX file,
+        # referencing the original template for content styling.
+        with tempfile.NamedTemporaryFile(
+            suffix=".docx", delete=False
+        ) as temp_template_file:
+            temp_template_file.write(template_bytes)
+            temp_template_path = temp_template_file.name
 
-        self._clear_body()
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False
+        ) as temp_markdown_file:
+            temp_markdown_file.write(markdown_text)
+            temp_markdown_path = temp_markdown_file.name
 
-        html = markdown.markdown(
-            markdown_text,
-            extensions=[
-                "tables",
-                "fenced_code",
-                "nl2br",
-                "sane_lists",
-                "attr_list",
-                "def_list",
-                "footnotes",
-                "md_in_html",
-            ],
-        )
+        pandoc_output_docx_path = ""
+        try:
+            pandoc_output_docx_path = os.path.join(
+                tempfile.gettempdir(), "pandoc_content.docx"
+            )
+            command = [
+                "pandoc",
+                "-s",
+                temp_markdown_path,
+                "-o",
+                pandoc_output_docx_path,
+                "--reference-doc",
+                temp_template_path,
+            ]
+            subprocess.run(command, check=True, capture_output=True)
 
-        soup = BeautifulSoup(f"<root>{html}</root>", "html.parser")
-        self._process_children(soup.find("root"))
+            # Step 2: Load the ORIGINAL template into python-docx. This is our base document.
+            self.doc = Document(BytesIO(template_bytes))
+            self.styles = _collect_style_names(self.doc)
 
-        out = BytesIO()
-        self.doc.save(out)
-        return out.getvalue()
+            # Step 3: Clear the existing body content of the template, preserving headers, footers, etc.
+            self._clear_body()
 
-    # ------------------------------------------------------------------
-    # Body management
-    # ------------------------------------------------------------------
+            # Step 4: Load the Pandoc-generated DOCX as a source for its content.
+            pandoc_doc = Document(pandoc_output_docx_path)
+
+            # Step 5: Append content from the Pandoc-generated document to the template's body.
+            for element in pandoc_doc.element.body:
+                self.doc.element.body.append(element)
+
+            # Step 6: Apply cover fields using python-docx
+            if cover_fields:
+                self._fill_cover_page(cover_fields)
+
+            # Step 7: Stamp fonts for consistency (if needed, this might be redundant if pandoc+reference-doc is perfect)
+            self._stamp_run_fonts()
+
+            final_output_buffer = BytesIO()
+            self.doc.save(final_output_buffer)
+            return final_output_buffer.getvalue()
+
+        finally:
+            # Clean up temporary files
+            os.remove(temp_template_path)
+            os.remove(temp_markdown_path)
+            if os.path.exists(pandoc_output_docx_path):
+                os.remove(pandoc_output_docx_path)
 
     def _clear_body(self) -> None:
-        """Remove every body child except the final sectPr."""
+        """Keep the cover-page section; remove everything after it except the final sectPr."""
         body = self.doc.element.body
-        to_remove = [c for c in body if c.tag != qn("w:sectPr")]
+        children = list(body)
+        cover_end = self._find_cover_end()
+        self._cover_end = cover_end
+
+        to_remove = [c for c in children[cover_end + 1 :] if c.tag != qn("w:sectPr")]
         for elem in to_remove:
             body.remove(elem)
 
-    # ------------------------------------------------------------------
-    # Tree traversal
-    # ------------------------------------------------------------------
+    def _find_cover_end(self) -> int:
+        """Return the index of the cover-page section-break paragraph."""
+        body = self.doc.element.body
+        for i, child in enumerate(body):
+            if child.tag == qn("w:p"):
+                pPr = child.find(qn("w:pPr"))
+                if pPr is not None and pPr.find(qn("w:sectPr")) is not None:
+                    return i
+        return 0
 
-    def _process_children(self, element) -> None:
-        for child in element.children:
-            if isinstance(child, NavigableString):
-                text = str(child).strip()
-                if text:
-                    self._add_paragraph(text, "Normal")
-            elif hasattr(child, "name") and child.name:
-                self._process_block(child)
+    def _stamp_run_fonts(self) -> None:
+        """
+        Stamp the hardcoded Mapfre rFonts (from _MAPFRE_RFONTS) onto every
+        generated run that doesn't already carry an explicit <w:rFonts>.
+        Runs inside the cover page are skipped.
+        Code runs (Courier New) are also skipped.
+        """
+        body = self.doc.element.body
+        children = list(body)
+        cover_end = self._find_cover_end()
 
-    def _process_block(self, element) -> None:
-        tag = element.name.lower()
-
-        # --- Headings ---
-        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
-            level = int(tag[1])
-            style = _best_style(self.styles, f"Heading {level}", "Normal")
-            p = self.doc.add_paragraph(style=style)
-            _inline(p, element)
-
-        # --- Paragraph ---
-        elif tag == "p":
-            # Image-only paragraph
-            imgs = element.find_all("img")
-            if imgs and not element.get_text(strip=True):
-                p = self.doc.add_paragraph()
-                for img in imgs:
-                    src = img.get("src", "")
-                    alt = img.get("alt", "")
-                    if src:
-                        img_bytes = _fetch_image(src)
-                        if img_bytes:
-                            try:
-                                run = p.add_run()
-                                run.add_picture(BytesIO(img_bytes), width=Inches(4))
-                                continue
-                            except Exception:
-                                pass
-                    p.add_run(f"[Image: {alt}]" if alt else "[Image]")
-            else:
-                style = _best_style(self.styles, "Body Text", "Normal")
-                p = self.doc.add_paragraph(style=style)
-                _inline(p, element)
-
-        # --- Lists ---
-        elif tag == "ul":
-            self._process_list(element, ordered=False, level=0)
-        elif tag == "ol":
-            self._process_list(element, ordered=True, level=0)
-
-        # --- Blockquote ---
-        elif tag == "blockquote":
-            q_style = _best_style(
-                self.styles, "Intense Quote", "Quote", "Body Text", "Normal"
-            )
-            for child in element.children:
-                if isinstance(child, NavigableString):
-                    text = str(child).strip()
-                    if text:
-                        self.doc.add_paragraph(text, style=q_style)
-                elif hasattr(child, "name") and child.name in ("p", "div", "span"):
-                    p = self.doc.add_paragraph(style=q_style)
-                    _inline(p, child)
-                else:
-                    # Recurse for nested blockquotes or other blocks
-                    self._process_block(child)
-
-        # --- Code block ---
-        elif tag == "pre":
-            code_elem = element.find("code")
-            code_text = (code_elem if code_elem else element).get_text()
-            style = _best_style(self.styles, "Code", "No Spacing", "Normal")
-            p = self.doc.add_paragraph(style=style)
-            run = p.add_run(code_text)
-            if style in (None, "Normal", "No Spacing"):
-                run.font.name = "Courier New"
-                run.font.size = Pt(9)
-
-        # --- Table ---
-        elif tag == "table":
-            self._process_table(element)
-
-        # --- Horizontal rule ---
-        elif tag == "hr":
-            p = self.doc.add_paragraph()
-            _add_horizontal_rule(p)
-
-        # --- Standalone image ---
-        elif tag == "img":
-            p = self.doc.add_paragraph()
-            src = element.get("src", "")
-            alt = element.get("alt", "")
-            if src:
-                img_bytes = _fetch_image(src)
-                if img_bytes:
-                    try:
-                        run = p.add_run()
-                        run.add_picture(BytesIO(img_bytes), width=Inches(4))
-                        return
-                    except Exception:
-                        pass
-            p.add_run(f"[Image: {alt}]" if alt else "[Image]")
-
-        # --- Generic container ---
-        elif tag in ("div", "section", "article", "main", "aside", "header",
-                     "footer", "figure", "figcaption"):
-            self._process_children(element)
-
-    # ------------------------------------------------------------------
-    # Lists
-    # ------------------------------------------------------------------
-
-    def _process_list(self, element, ordered: bool, level: int) -> None:
-        base_style = "List Number" if ordered else "List Bullet"
-        # python-docx ships "List Bullet 2", "List Bullet 3", etc.
-        level_suffix = "" if level == 0 else f" {min(level + 1, 3)}"
-        style = _best_style(
-            self.styles,
-            f"{base_style}{level_suffix}",
-            base_style,
-            "Normal",
-        )
-
-        for child in element.children:
-            if not hasattr(child, "name") or child.name != "li":
+        for child in children[cover_end + 1 :]:
+            if child.tag != qn("w:p"):
                 continue
 
-            # Collect nested sub-list (if any)
-            nested = child.find(["ul", "ol"])
+            pPr = child.find(qn("w:pPr"))
+            pStyle_elem = pPr.find(qn("w:pStyle")) if pPr is not None else None
+            style_id = pStyle_elem.get(qn("w:val")) if pStyle_elem is not None else None
 
-            p = self.doc.add_paragraph(style=style)
-            if level > 0:
-                p.paragraph_format.left_indent = Inches(0.25 * (level + 1))
+            fonts = _MAPFRE_RFONTS.get(style_id, _MAPFRE_RFONTS[None])
 
-            # Add li text, skipping nested list nodes
-            for item_child in child.children:
-                if hasattr(item_child, "name") and item_child.name in ("ul", "ol"):
-                    continue
-                if isinstance(item_child, NavigableString):
-                    text = str(item_child)
-                    if text.strip():
-                        p.add_run(text)
-                elif hasattr(item_child, "name"):
-                    _inline(p, item_child)
+            for run in child.findall(qn("w:r")):
+                rPr = run.find(qn("w:rPr"))
+                if rPr is None:
+                    rPr = OxmlElement("w:rPr")
+                    run.insert(0, rPr)
+                if rPr.find(qn("w:rFonts")) is None:
+                    rPr.insert(0, _make_rfonts(*fonts))
 
-            # Recurse into nested list
-            if nested:
-                self._process_list(
-                    nested, ordered=(nested.name == "ol"), level=level + 1
-                )
-
-    # ------------------------------------------------------------------
-    # Tables
-    # ------------------------------------------------------------------
-
-    def _process_table(self, element) -> None:
-        rows = element.find_all("tr")
-        if not rows:
-            return
-
-        max_cols = max(
-            (len(r.find_all(["td", "th"])) for r in rows), default=0
-        )
-        if max_cols == 0:
-            return
-
-        table = self.doc.add_table(rows=len(rows), cols=max_cols)
-
-        # Apply a table style if one exists
-        for candidate in ("Table Grid", "Light Grid", "Medium Grid 1",
-                          "Medium Shading 1 Accent 1", "Table Normal"):
-            if candidate in self.styles:
-                try:
-                    table.style = candidate
-                except Exception:
-                    pass
+    @staticmethod
+    def _replace_across_runs(element, find: str, replace: str) -> None:
+        """Replace *find* with *replace* even when the text spans multiple w:t nodes."""
+        while True:
+            t_nodes = list(element.iter(qn("w:t")))
+            texts = [t.text or "" for t in t_nodes]
+            full = "".join(texts)
+            if find not in full:
                 break
 
-        for row_idx, tr in enumerate(rows):
-            cells = tr.find_all(["td", "th"])
-            for col_idx, cell_elem in enumerate(cells):
-                if col_idx >= max_cols:
-                    break
-                cell = table.cell(row_idx, col_idx)
-                # Clear the auto-created empty paragraph
-                cell.paragraphs[0].clear()
-                p = cell.paragraphs[0]
-                _inline(p, cell_elem)
-                if cell_elem.name == "th":
-                    for run in p.runs:
-                        run.bold = True
+            start = full.index(find)
+            end = start + len(find)
 
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
+            # Map character ranges to node indices
+            cum, spans = 0, []
+            for txt in texts:
+                spans.append((cum, cum + len(txt)))
+                cum += len(txt)
 
-    def _add_paragraph(self, text: str, style: str) -> None:
-        resolved = _best_style(self.styles, style, "Normal")
-        self.doc.add_paragraph(text, style=resolved)
+            affected = [
+                i for i, (ns, ne) in enumerate(spans) if ne > start and ns < end
+            ]
+            if not affected:
+                break
+
+            fi, li = affected[0], affected[-1]
+            prefix = texts[fi][: max(0, start - spans[fi][0])]
+            suffix = texts[li][max(0, end - spans[li][0]) :]
+
+            if fi == li:
+                t_nodes[fi].text = prefix + replace + suffix
+            else:
+                t_nodes[fi].text = prefix + replace
+                for i in affected[1:-1]:
+                    t_nodes[i].text = ""
+                t_nodes[li].text = suffix
+
+    def _fill_cover_page(self, cover_fields: dict) -> None:
+        """Replace cover-page placeholders with the values in *cover_fields*."""
+        body = self.doc.element.body
+        children = list(body)
+        cover_end = self._find_cover_end()
+
+        audit_code = cover_fields.get("audit_code", "")
+        audit_title = cover_fields.get("audit_title", "")
+        uai = cover_fields.get("uai", "")
+        date = cover_fields.get("date", "")
+        recipients = cover_fields.get("recipients", [])
+
+        for elem in children[: cover_end + 1]:
+            if audit_code:
+                self._replace_across_runs(elem, "26XX-XXXX", audit_code)
+            if audit_title:
+                self._replace_across_runs(
+                    elem, "TÍTULO DE LA AUDITORÍA", audit_title.upper()
+                )
+            if uai:
+                self._replace_across_runs(elem, "UAI de XXX", uai)
+            if date:
+                for placeholder in ("xx/xx/xxxx", "XX/XX/XXXX", "xx/XX/XXXX"):
+                    self._replace_across_runs(elem, placeholder, date)
+
+        # Recipients — each `D. ` or `Dª. ` w:t node is a placeholder slot
+        if recipients:
+            slot_tags = ("D. ", "Dª. ")
+            slot_idx = 0
+            for elem in children[: cover_end + 1]:
+                for t in elem.iter(qn("w:t")):
+                    if slot_idx >= len(recipients):
+                        break
+                    if t.text in slot_tags:
+                        t.text = recipients[slot_idx]
+                        slot_idx += 1

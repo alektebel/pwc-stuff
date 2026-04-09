@@ -1,0 +1,54 @@
+
+# config.yaml: Markdown to Word Style Mappings
+
+# This configuration file maps common markdown elements to specific paragraph and character
+# styles defined in your Word template (e.g., plantilla-corrected-fixed.docx).
+#
+# IMPORTANT:
+# - Use the exact 'Name' of the style as it appears in Word's style pane.
+# - If a style is not found in the template, direct formatting will be used as a fallback
+#   for common inline elements (bold, italic, code, etc.) to ensure visual representation.
+# - Character styles are crucial for inline formatting. If your template lacks specific
+#   character styles like "Strong" or "Code", you might consider adding them to your template
+#   for more consistent results.
+
+paragraph_styles:
+  # Headings (h1 to h6)
+  h1: "Título 1" # Example: Maps markdown # Heading 1 to Word's "Título 1" style
+  h2: "Título 2"
+  h3: "Título 3"
+  h4: "Título 4"
+  h5: "Título 5"
+  h6: "Título 6"
+
+  # Standard Paragraph
+  p: "Párrafo" # Maps markdown paragraphs to Word's "Párrafo" style
+
+  # Blockquote
+  blockquote: "Cita destacada" # Maps markdown > Blockquote to Word's "Cita destacada" style
+
+  # Code Block (```python ... ```)
+  code_block: "Código" # Maps markdown fenced code blocks to Word's "Código" style
+
+  # List Items
+  list_item_bullet: "Viñetas" # Maps markdown * List Item to Word's "Viñetas" style
+  list_item_number: "Numeración" # Maps markdown 1. List Item to Word's "Numeración" style
+
+character_styles:
+  # Inline Bold (**bold** or __bold__)
+  strong: "Énfasis fuerte" # Maps to Word's character style named "Énfasis fuerte"
+  
+  # Inline Italic (*italic* or _italic_)
+  em: "Énfasis" # Maps to Word's character style named "Énfasis"
+
+  # Inline Code (`code`)
+  code: "Code Char" # Maps to Word's character style named "Code Char"
+
+  # Inline Underline (<u>underline</u> - though not standard markdown, often generated from HTML)
+  u: "Subrayado" # Maps to Word's character style named "Subrayado"
+
+  # Inline Strikethrough (~~strike~~ - common markdown extension)
+  s: "Tachado" # Maps to Word's character style named "Tachado"
+
+  # Hyperlinks ([link](url))
+  a: "Hipervínculo" # Maps to Word's character style named "Hipervínculo"
